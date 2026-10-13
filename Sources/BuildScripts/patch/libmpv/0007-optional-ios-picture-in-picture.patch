@@ -1,0 +1,190 @@
+diff --git a/meson.build b/meson.build
+index 694f808..5f9e08a 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1333,7 +1333,7 @@ if host_machine.system() == 'darwin'
+     )
+     features += {'moltenvk': moltenvk.allowed()}
+     if features['vulkan'] and features['moltenvk']
+-        sources += files('video/out/vulkan/context_moltenvk.m')
++        sources += files('video/out/vulkan/context_moltenvk.m', 'video/out/nuvio_pip.m')
+     endif
+ endif
+ 
+diff --git a/video/out/nuvio_pip.m b/video/out/nuvio_pip.m
+new file mode 100644
+index 0000000..97ce5ac
+--- /dev/null
++++ b/video/out/nuvio_pip.m
+@@ -0,0 +1,37 @@
++// Local PiP prototype. The host retains the Metal layer for the lifetime of the VO.
++#import <Foundation/Foundation.h>
++#import <CoreVideo/CoreVideo.h>
++#import <TargetConditionals.h>
++#include "video/mp_image.h"
++#include "video/img_format.h"
++
++@protocol NuvioPiPFrameSink <NSObject>
++@property (readonly) BOOL nuvioPiPConsumesVideo;
++- (void)nuvioEnqueuePiPFrame:(CVPixelBufferRef)buffer presentationTime:(double)pts isPictureInPictureFrame:(BOOL)active;
++@end
++
++bool nuvio_pip_active(int64_t layer)
++{
++    if (layer <= 0 || !TARGET_OS_IOS || TARGET_OS_MACCATALYST)
++        return false;
++    id object = (__bridge id)(void *)(intptr_t)layer;
++    return [object respondsToSelector:@selector(nuvioPiPConsumesVideo)] &&
++        [(id<NuvioPiPFrameSink>)object nuvioPiPConsumesVideo];
++}
++
++bool nuvio_pip_offer_frame(int64_t layer, struct mp_image *image)
++{
++    const bool active = nuvio_pip_active(layer);
++    if (layer <= 0 || !TARGET_OS_IOS || TARGET_OS_MACCATALYST)
++        return false;
++    if (!image || image->imgfmt != IMGFMT_VIDEOTOOLBOX || !image->planes[3])
++        return active;
++    id object = (__bridge id)(void *)(intptr_t)layer;
++    if ([object respondsToSelector:@selector(nuvioEnqueuePiPFrame:presentationTime:isPictureInPictureFrame:)]) {
++        @autoreleasepool {
++            [(id<NuvioPiPFrameSink>)object nuvioEnqueuePiPFrame:
++                (CVPixelBufferRef)image->planes[3] presentationTime:image->pts isPictureInPictureFrame:active];
++        }
++    }
++    return active;
++}
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 2d95eb8..99881f6 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -61,6 +61,18 @@
+ #endif
+ 
+ 
++#if HAVE_MOLTENVK
++#include <TargetConditionals.h>
++#define HAVE_NUVIO_PIP (TARGET_OS_IOS && !TARGET_OS_MACCATALYST)
++#else
++#define HAVE_NUVIO_PIP 0
++#endif
++
++#if HAVE_NUVIO_PIP
++bool nuvio_pip_active(int64_t layer);
++bool nuvio_pip_offer_frame(int64_t layer, struct mp_image *image);
++#endif
++
+ struct osd_entry {
+     pl_tex tex;
+     struct pl_overlay_part *parts;
+@@ -134,6 +146,10 @@ struct priv {
+     bool is_interpolated;
+     bool want_reset;
+     bool frame_pending;
++#if HAVE_NUVIO_PIP
++    bool nuvio_pip_frame;
++    bool nuvio_pip_reconfigure;
++#endif
+ 
+     pl_options pars;
+     struct m_config_cache *opts_cache;
+@@ -1002,9 +1018,25 @@ static enum pl_color_primaries get_best_prim_container(const struct pl_raw_prima
+ static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
+                                      const struct mp_image *mpi);
+ 
++static int reconfig(struct vo *vo, struct mp_image_params *params);
++
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ {
+     struct priv *p = vo->priv;
++#if HAVE_NUVIO_PIP
++    p->nuvio_pip_frame = nuvio_pip_offer_frame(vo->opts->WinID, frame->current);
++    if (p->nuvio_pip_frame) {
++        // MPV still decodes and schedules against audio. Do not acquire a drawable,
++        // map hardware frames, render with libplacebo or present Metal in PiP.
++        p->want_reset = true;
++        p->nuvio_pip_reconfigure = true;
++        return VO_TRUE;
++    }
++    if (p->nuvio_pip_reconfigure) {
++        p->nuvio_pip_reconfigure = false;
++        reconfig(vo, vo->params);
++    }
++#endif
+     pl_options pars = p->pars;
+     pl_gpu gpu = p->gpu;
+     update_options(vo);
+@@ -1446,6 +1478,11 @@ done:
+ static void flip_page(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
++#if HAVE_NUVIO_PIP
++    // Pair presentation with the decision made in draw_frame, never a later flag read.
++    if (p->nuvio_pip_frame)
++        return;
++#endif
+     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+ 
+     if (p->frame_pending) {
+@@ -1459,6 +1496,10 @@ static void flip_page(struct vo *vo)
+ 
+ static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
+ {
++#if HAVE_NUVIO_PIP
++    if (nuvio_pip_active(vo->opts->WinID))
++        return;
++#endif
+     struct priv *p = vo->priv;
+     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+     if (sw->fns->get_vsync)
+@@ -1481,6 +1522,12 @@ static int query_format(struct vo *vo, int format)
+ static void resize(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
++#if HAVE_NUVIO_PIP
++    if (nuvio_pip_active(vo->opts->WinID)) {
++        p->nuvio_pip_reconfigure = true;
++        return;
++    }
++#endif
+     struct mp_rect src, dst;
+     struct mp_osd_res osd;
+     vo_get_src_dst_rects(vo, &src, &dst, &osd);
+@@ -1502,6 +1549,12 @@ static void resize(struct vo *vo)
+ 
+ static int reconfig(struct vo *vo, struct mp_image_params *params)
+ {
++#if HAVE_NUVIO_PIP
++    if (nuvio_pip_active(vo->opts->WinID)) {
++        ((struct priv *)vo->priv)->nuvio_pip_reconfigure = true;
++        return 0;
++    }
++#endif
+     struct priv *p = vo->priv;
+     if (!p->ra_ctx->fns->reconfig(p->ra_ctx))
+         return -1;
+@@ -1797,6 +1850,13 @@ static void update_ra_ctx_options(struct vo *vo, struct ra_ctx_opts *ctx_opts)
+ static int control(struct vo *vo, uint32_t request, void *data)
+ {
+     struct priv *p = vo->priv;
++#if HAVE_NUVIO_PIP
++    if (nuvio_pip_active(vo->opts->WinID) && request != VOCTRL_LOAD_HWDEC_API) {
++        p->want_reset = true;
++        p->nuvio_pip_reconfigure = true;
++        return VO_NOTIMPL;
++    }
++#endif
+ 
+     switch (request) {
+     case VOCTRL_SET_PANSCAN:
+@@ -1855,6 +1915,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         return true;
+     }
+ 
++#if HAVE_NUVIO_PIP
++    if (nuvio_pip_active(vo->opts->WinID))
++        return VO_NOTIMPL;
++#endif
+     int events = 0;
+     int r = p->ra_ctx->fns->control(p->ra_ctx, &events, request, data);
+     if (events & VO_EVENT_ICC_PROFILE_CHANGED) {
