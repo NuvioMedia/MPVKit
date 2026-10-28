@@ -1,0 +1,19 @@
+diff --git a/audio/out/ao_audiounit.m b/audio/out/ao_audiounit.m
+index f2cf692..eb78ab5 100644
+--- a/audio/out/ao_audiounit.m
++++ b/audio/out/ao_audiounit.m
+@@ -178,8 +178,12 @@ static bool init_audiounit(struct ao *ao)
+         options |= AVAudioSessionCategoryOptionMixWithOthers;
+     }
+ 
+-    [instance setCategory:AVAudioSessionCategoryPlayback withOptions:options error:nil];
+-    [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
++    // Keep a session the host already configured for playback: resetting the
++    // category here drops its route sharing policy and call-mixing choice.
++    if (![instance.category isEqualToString:AVAudioSessionCategoryPlayback]) {
++        [instance setCategory:AVAudioSessionCategoryPlayback withOptions:options error:nil];
++        [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
++    }
+     [instance setActive:YES error:nil];
+ 
+     bool shared_audio = instance.otherAudioPlaying;
