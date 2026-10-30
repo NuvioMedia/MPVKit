@@ -1,0 +1,170 @@
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -224,6 +224,18 @@
+     struct demux_packet **requeue_packets;
+     int num_requeue_packets;
+ 
++    // Nuvio: packets since the last keyframe. iOS invalidates the VideoToolbox
++    // session while the PiP window is covered; replaying them lets the new
++    // session resume at once instead of waiting for the next keyframe.
++    struct demux_packet **gop_packets;
++    int num_gop_packets;
++    size_t gop_bytes;
++    bool gop_valid;
++    bool gop_recover;
++    int gop_replays;
++    double gop_drop_pts;
++    double last_out_pts;
++
+     struct mp_image **delay_queue;
+     int num_delay_queue;
+     int max_delay_queue;
+@@ -660,6 +672,66 @@
+     mp_info(log, "  auto-copy-unsafe\n");
+ 
+     return M_OPT_EXIT;
++}
++
++static void reset_avctx(struct mp_filter *vd);
++
++#define NUVIO_GOP_MAX_BYTES (96 * 1024 * 1024)
++#define NUVIO_GOP_MAX_PACKETS 1200
++#define NUVIO_GOP_MAX_REPLAYS 3
++
++static void gop_clear(vd_ffmpeg_ctx *ctx)
++{
++    for (int n = 0; n < ctx->num_gop_packets; n++)
++        talloc_free(ctx->gop_packets[n]);
++    ctx->num_gop_packets = 0;
++    ctx->gop_bytes = 0;
++}
++
++static void gop_record(struct mp_filter *vd, struct demux_packet *pkt)
++{
++    vd_ffmpeg_ctx *ctx = vd->priv;
++
++    if (pkt->keyframe) {
++        gop_clear(ctx);
++        ctx->gop_valid = true;
++        ctx->gop_replays = 0;
++    }
++    if (!ctx->gop_valid)
++        return;
++    struct demux_packet *copy = NULL;
++    if (ctx->num_gop_packets < NUVIO_GOP_MAX_PACKETS &&
++        ctx->gop_bytes + pkt->len <= NUVIO_GOP_MAX_BYTES)
++        copy = demux_copy_packet(vd->packet_pool, pkt);
++    if (!copy) {
++        // Too long to keep: behave as before until the next keyframe.
++        gop_clear(ctx);
++        ctx->gop_valid = false;
++        return;
++    }
++    MP_TARRAY_APPEND(ctx, ctx->gop_packets, ctx->num_gop_packets, copy);
++    ctx->gop_bytes += pkt->len;
++}
++
++static void gop_replay(struct mp_filter *vd)
++{
++    vd_ffmpeg_ctx *ctx = vd->priv;
++
++    ctx->gop_recover = false;
++    ctx->gop_replays += 1;
++    ctx->hwdec_fail_count = 0;
++    MP_VERBOSE(vd, "Hardware decoder lost, replaying %d packets from the "
++               "last keyframe.\n", ctx->num_gop_packets);
++    reset_avctx(vd);
++    for (int n = 0; n < ctx->num_gop_packets; n++) {
++        struct demux_packet *copy = demux_copy_packet(vd->packet_pool,
++                                                      ctx->gop_packets[n]);
++        if (copy)
++            MP_TARRAY_APPEND(ctx, ctx->requeue_packets,
++                             ctx->num_requeue_packets, copy);
++    }
++    // Frames up to the last one shown are decoded only as references.
++    ctx->gop_drop_pts = ctx->last_out_pts;
+ }
+ 
+ static void force_fallback(struct mp_filter *vd)
+@@ -711,6 +783,9 @@
+ 
+     mp_assert(!ctx->avctx);
+ 
++    ctx->gop_drop_pts = MP_NOPTS_VALUE;
++    ctx->last_out_pts = MP_NOPTS_VALUE;
++
+     const AVCodec *lavc_codec = NULL;
+ 
+     if (ctx->use_hwdec) {
+@@ -900,6 +975,12 @@
+         talloc_free(ctx->requeue_packets[n]);
+     ctx->num_requeue_packets = 0;
+ 
++    gop_clear(ctx);
++    ctx->gop_valid = false;
++    ctx->gop_recover = false;
++    ctx->gop_drop_pts = MP_NOPTS_VALUE;
++    ctx->last_out_pts = MP_NOPTS_VALUE;
++
+     reset_avctx(vd);
+ }
+ 
+@@ -1161,6 +1242,10 @@
+         ctx->hwdec_fail_count += 1;
+         if (ctx->hwdec_fail_count >= hwdec_opts->software_fallback)
+             ctx->hwdec_failed = true;
++        if (ctx->hwdec_fail_count >= 2 && ctx->gop_valid &&
++            ctx->num_gop_packets && !ctx->num_requeue_packets &&
++            ctx->gop_replays < NUVIO_GOP_MAX_REPLAYS)
++            ctx->gop_recover = true;
+     }
+ }
+ 
+@@ -1171,6 +1256,7 @@
+ 
+     if (ctx->num_requeue_packets && ctx->requeue_packets[0] != pkt)
+         return AVERROR(EAGAIN); // cannot consume the packet
++    bool requeued = ctx->num_requeue_packets && ctx->requeue_packets[0] == pkt;
+ 
+     if (ctx->hwdec_failed)
+         return AVERROR(EAGAIN);
+@@ -1189,6 +1275,9 @@
+     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+         return ret;
+ 
++    if (ctx->use_hwdec && pkt && !requeued)
++        gop_record(vd, pkt);
++
+     if (ctx->hw_probing && ctx->num_sent_packets < 32 &&
+         ctx->hwdec_opts->software_fallback <= 32)
+     {
+@@ -1282,6 +1371,11 @@
+ 
+     int ret = decode_frame(vd);
+ 
++    if (ctx->gop_recover && !ctx->hwdec_failed) {
++        gop_replay(vd);
++        return 0; // force retry, so send_queued_packet() gets called
++    }
++
+     if (ctx->hwdec_failed) {
+         // Failed hardware decoding? Try the next one, and eventually software.
+         struct demux_packet **pkts = ctx->sent_packets;
+@@ -1337,6 +1431,16 @@
+         }
+     }
+ 
++    if (ctx->gop_drop_pts != MP_NOPTS_VALUE) {
++        if (res->pts != MP_NOPTS_VALUE && res->pts <= ctx->gop_drop_pts) {
++            talloc_free(res);
++            return 0;
++        }
++        ctx->gop_drop_pts = MP_NOPTS_VALUE;
++    }
++    if (res->pts != MP_NOPTS_VALUE)
++        ctx->last_out_pts = res->pts;
++
+     if (!ctx->hwdec_notified) {
+         if (ctx->use_hwdec) {
+             MP_INFO(vd, "Using hardware decoding (%s).\n",
