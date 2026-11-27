@@ -1,0 +1,38 @@
+From 0562b67860b1cb5810473da76c6ddb88997d7b00 Mon Sep 17 00:00:00 2001
+From: WhiteGiso <gianluca.sorbello@outlook.it>
+Date: Fri, 27 Nov 2026 09:05:54 +0100
+Subject: [PATCH] avformat/hls: keep the whole EXT-X-KEY METHOD value
+
+method is an 11-byte buffer, but SAMPLE-AES-CTR, the method that CENC
+playlists use (ClearKey among them), is 14 characters. ff_parse_key_value()
+cuts the value to "SAMPLE-AES", hls_read_header() sets
+key_type = KEY_SAMPLE_AES and then tries to download the key URI found in
+the tag. With a data: URI the extension check rejects it, with an https URI
+the request may fail as well, and in both cases the whole stream does not
+open ("Unable to open key file") even when the segments are already
+decrypted through the fMP4 keys passed to the segment demuxer with
+seg_format_options.
+
+Enlarge the buffer so the comparison sees the real value. SAMPLE-AES-CTR
+then matches none of the methods the HLS demuxer handles and stays
+KEY_NONE, exactly like a playlist without an EXT-X-KEY tag.
+---
+ libavformat/hls.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libavformat/hls.c b/libavformat/hls.c
+index 2f7142f..c94288c 100644
+--- a/libavformat/hls.c
++++ b/libavformat/hls.c
+@@ -394,7 +394,7 @@ static void handle_variant_args(struct variant_info *info, const char *key,
+ 
+ struct key_info {
+      char uri[MAX_URL_SIZE];
+-     char method[11];
++     char method[16];
+      char iv[35];
+ };
+ 
+-- 
+2.54.0 (Apple Git-157)
+
